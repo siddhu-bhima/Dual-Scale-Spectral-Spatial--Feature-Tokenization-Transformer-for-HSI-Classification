@@ -1,0 +1,167 @@
+In SSFTTnet.py
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
+
+NUM_CLASS = 15   # Houston classes
+
+# ---------------- Transformer ---------------- #
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
+
+class LayerNormalize(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+
+class MLP_Block(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8, dropout=0.1):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim ** -0.5
+
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.nn1 = nn.Linear(dim, dim)
+        self.do1 = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        b, n, _, h = *x.shape, self.heads
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
+
+        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        attn = dots.softmax(dim=-1)
+
+        out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.nn1(out)
+        out = self.do1(out)
+        return out
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, mlp_dim, dropout):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Residual(LayerNormalize(dim, Attention(dim, heads, dropout))),
+                Residual(LayerNormalize(dim, MLP_Block(dim, mlp_dim, dropout)))
+            ]))
+
+    def forward(self, x, mask=None):
+        for attn, mlp in self.layers:
+            x = attn(x, mask=mask)
+            x = mlp(x)
+        return x
+
+# ---------------- DS-SSFTT MODEL ---------------- #
+
+class SSFTTnet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=NUM_CLASS,
+                 num_tokens=4, dim=64, depth=1, heads=8,
+                 mlp_dim=8, dropout=0.1, emb_dropout=0.1):
+
+        super().__init__()
+
+        self.L = num_tokens
+
+        # -------- Small Branch -------- #
+        self.conv3d_small = nn.Sequential(
+            nn.Conv3d(in_channels, 8, kernel_size=(3,3,3), padding=(0,1,1)),
+            nn.BatchNorm3d(8),
+            nn.ReLU(),
+        )
+
+        self.conv2d_small = nn.Sequential(
+            nn.Conv2d(304, 64, kernel_size=3),   # 🔥 FIXED FOR HOUSTON
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+
+        # -------- Large Branch -------- #
+        self.conv3d_large = nn.Sequential(
+            nn.Conv3d(in_channels, 8, kernel_size=(3,3,3),
+                      dilation=(1,2,2), padding=(0,2,2)),
+            nn.BatchNorm3d(8),
+            nn.ReLU(),
+        )
+
+        self.conv2d_large = nn.Sequential(
+            nn.Conv2d(304, 64, kernel_size=3),   # 🔥 FIXED
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+
+        # -------- Tokenization -------- #
+        self.token_wA = nn.Parameter(torch.randn(1, num_tokens, 64))
+        self.token_wV = nn.Parameter(torch.randn(1, 64, dim))
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_tokens+1, dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = Transformer(dim, depth, heads, mlp_dim, dropout)
+
+        self.fc = nn.Linear(dim, num_classes)
+
+    def forward(self, x):
+
+        # Small branch
+        xs = self.conv3d_small(x)
+        xs = rearrange(xs, 'b c d h w -> b (c d) h w')
+        xs = self.conv2d_small(xs)
+
+        # Large branch
+        xl = self.conv3d_large(x)
+        xl = rearrange(xl, 'b c d h w -> b (c d) h w')
+        xl = self.conv2d_large(xl)
+
+        # Fusion
+        x = xs + xl
+
+        x = rearrange(x, 'b c h w -> b (h w) c')
+
+        # Tokenization
+        wa = rearrange(self.token_wA, 'b h w -> b w h')
+        A = torch.einsum('bij,bjk->bik', x, wa)
+        A = rearrange(A, 'b h w -> b w h').softmax(dim=-1)
+
+        V = torch.einsum('bij,bjk->bik', x, self.token_wV)
+        T = torch.einsum('bij,bjk->bik', A, V)
+
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, T), dim=1)
+
+        x = x + self.pos_embedding
+        x = self.dropout(x)
+
+        x = self.transformer(x)
+        x = x[:, 0]
+
+        x = self.fc(x)
+
+        return x
